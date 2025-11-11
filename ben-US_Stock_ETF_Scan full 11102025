@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""
+美股 + ETF 自动扫描脚本（稳定版）
+作者：Ben GPT
+日期：2025-11-10
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+import requests, io, time
+from datetime import datetime
+
+# ============ 参数设置 ============
+OUTPUT_PATH = f"US_Stock_ETF_Scan_{datetime.now().strftime('%Y%m%d')}.xlsx"
+ETF_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE"]
+
+# ============ 自动股票池 ============
+def get_us_symbols(min_marketcap=1e9, limit=None):
+    """
+    获取美股主板（NASDAQ / NYSE）市值 >= 10亿美元的股票代码
+    """
+    print("⏳ 正在获取美股主板列表...")
+    url = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
+    try:
+        df = pd.read_csv(io.StringIO(requests.get(url, timeout=10).text))
+        tickers = df["Symbol"].dropna().unique().tolist()
+    except Exception as e:
+        print(f"⚠️ 无法获取列表，改用默认股票池: {e}")
+        tickers = ["AAPL","MSFT","META","NVDA","AMD","GOOGL","TSLA","AVGO"]
+    selected = []
+    for i, t in enumerate(tickers):
+        try:
+            info = yf.Ticker(t).fast_info
+            mcap = info.get("marketCap", 0)
+            if mcap and mcap >= min_marketcap:
+                selected.append(t)
+        except Exception:
+            continue
+        if limit and len(selected) >= limit:
+            break
+        if i % 100 == 0:
+            print(f"  已扫描 {i} 只，符合 {len(selected)} 只")
+    print(f"✅ 股票池加载完成，共 {len(selected)} 只（市值≥10亿美元）")
+    return selected
+
+# ============ 工具函数 ============
+def to_series(x):
+    if isinstance(x, pd.Series): return x
+    if isinstance(x, pd.DataFrame): return x.iloc[:,0]
+    return pd.Series(np.asarray(x).reshape(-1))
+
+def get_last_value(s):
+    """安全提取最后一个标量值"""
+    try:
+        v = s.iloc[-1]
+        if isinstance(v, (pd.Series, np.ndarray, list)):
+            v = np.asarray(v).reshape(-1)[-1]
+        if pd.isna(v):
+            return np.nan
+        return float(v)
+    except Exception:
+        return np.nan
+
+# ============ 下载与指标计算 ============
+def get_stock_data(symbol):
+    try:
+        data = yf.download(symbol, period="3mo", interval="1d", auto_adjust=False, progress=False)
+        if data is None or len(data) < 50:
+            return None
+        close = to_series(data["Close"]).astype(float)
+        vol = to_series(data["Volume"]).astype(float)
+        data["RSI"] = ta.momentum.RSIIndicator(close, 14).rsi()
+        macd_obj = ta.trend.MACD(close)
+        data["MACD"] = macd_obj.macd()
+        data["Signal"] = macd_obj.macd_signal()
+        data["MA20"] = close.rolling(20).mean()
+        data["MA50"] = close.rolling(50).mean()
+        data["Close"], data["Volume"] = close, vol
+        return data
+    except Exception:
+        return None
+
+# ============ ETF 概览 ============
+def build_etf_overview(df, symbol):
+    close, ma20, ma50 = get_last_value(df["Close"]), get_last_value(df["MA20"]), get_last_value(df["MA50"])
+    rsi, macd, signal = get_last_value(df["RSI"]), get_last_value(df["MACD"]), get_last_value(df["Signal"])
+    ma20_up = get_last_value(df["MA20"].diff()) > 0
+    ma50_up = get_last_value(df["MA50"].diff()) > 0
+    return {
+        "ETF": symbol,
+        "收盘价": round(close, 2),
+        "RSI": round(rsi, 1),
+        "站上MA20": close > ma20 if pd.notna(ma20) else None,
+        "站上MA50": close > ma50 if pd.notna(ma50) else None,
+        "MACD>Signal": macd > signal if pd.notna(macd) and pd.notna(signal) else None,
+        "MA20上升": ma20_up,
+        "MA50上升": ma50_up,
+        "与MA20偏离%": round((close/ma20 - 1)*100, 2) if ma20 else None,
+        "与MA50偏离%": round((close/ma50 - 1)*100, 2) if ma50 else None,
+    }
+
+# ============ 打分模型 ============
+def score_stock(df):
+    close, prev = get_last_value(df["Close"]), get_last_value(df["Close"].shift(1))
+    ma20, ma50 = get_last_value(df["MA20"]), get_last_value(df["MA50"])
+    rsi, macd, signal = get_last_value(df["RSI"]), get_last_value(df["MACD"]), get_last_value(df["Signal"])
+    vol, vol_ma = get_last_value(df["Volume"]), get_last_value(df["Volume"].rolling(20).mean())
+    score, vol_ratio = 0, np.nan
+
+    # 趋势动能
+    if close > ma20: score += 10
+    if close > ma50: score += 10
+    if rsi >= 55: score += 10
+    if macd > signal: score += 10
+
+    # 资金流
+    if vol_ma and vol_ma > 0:
+        vol_ratio = vol / vol_ma
+        if vol_ratio > 1.2: score += 10
+    if close > prev and macd > signal: score += 10
+
+    # 波动 / 估值
+    if 5 < rsi < 75: score += 10
+    if ma50 > 0 and (close / ma50) < 1.2: score += 10
+    if ma20 > 0 and 0.9 < (close / ma20) < 1.1: score += 10
+    if pd.notna(vol_ratio) and vol_ratio < 3: score += 10
+
+    return round(score, 1), round(rsi, 1) if pd.notna(rsi) else None, round(vol_ratio, 2) if pd.notna(vol_ratio) else None
+
+# ============ 主逻辑 ============
+if __name__ == "__main__":
+    print("🚀 开始扫描美股+ETF ...")
+    symbols = get_us_symbols(min_marketcap=1e9, limit=100)  # limit可改为None扫描全市场
+    all_symbols = list(dict.fromkeys(symbols + ETF_SYMBOLS))
+    results, etf_overview = [], []
+
+    for i, s in enumerate(all_symbols):
+        print(f"🔎 [{i+1}/{len(all_symbols)}] 扫描 {s} ...")
+        df = get_stock_data(s)
+        if df is None:
+            print(f"⚠️ {s} 数据不足或无法下载，跳过。")
+            continue
+        if s in ETF_SYMBOLS:
+            etf_overview.append(build_etf_overview(df, s))
+        score, rsi, vol_ratio = score_stock(df)
+        close, prev_close = get_last_value(df["Close"]), get_last_value(df["Close"].shift(1))
+        change = (close / prev_close - 1.0) * 100 if prev_close else 0
+        if score >= 85:
+            rating = "⭐ 强买入"
+        elif score >= 70:
+            rating = "✅ 买入"
+        elif score >= 55:
+            rating = "👀 观察"
+        else:
+            rating = "⚠️ 中性/回避"
+        results.append({
+            "类别": "ETF" if s in ETF_SYMBOLS else "股票",
+            "代码": s,
+            "收盘价": round(close, 2),
+            "涨跌幅 %": round(change, 2),
+            "RSI": rsi,
+            "成交量/均量比": vol_ratio,
+            "策略评分": score,
+            "评级": rating
+        })
+        time.sleep(0.5)
+
+    df_all = pd.DataFrame(results)
+    df_overview = pd.DataFrame(etf_overview)
+    df_stock = df_all[df_all["类别"] == "股票"]
+    df_etf = df_all[df_all["类别"] == "ETF"]
+
+    # 输出Excel
+    print("📊 正在导出Excel...")
+    def export_by_rating(sub_df, prefix, writer):
+        for rate in ["⭐ 强买入","✅ 买入","👀 观察","⚠️ 中性/回避"]:
+            sub_df[sub_df["评级"] == rate].to_excel(writer, sheet_name=f"{prefix} {rate}", index=False)
+
+    with pd.ExcelWriter(OUTPUT_PATH) as writer:
+        export_by_rating(df_stock, "Stock", writer)
+        export_by_rating(df_etf, "ETF", writer)
+        df_overview.to_excel(writer, sheet_name="ETF Overview", index=False)
+        df_all.groupby("评级")["策略评分"].agg(["count","mean"]).reset_index().to_excel(writer, sheet_name="Summary", index=False)
+
+    print(f"✅ 扫描完成！文件已生成：{OUTPUT_PATH}")
